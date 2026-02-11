@@ -1,0 +1,322 @@
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+from abc import ABC, abstractmethod
+from scipy.stats import binom, poisson, norm, expon, geom, uniform
+import networkx as nx
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+
+# ============================================================
+# 2. DISTRIBUTIONS
+# ============================================================
+class Distribution(ABC):
+    @abstractmethod
+    def sample(self, size=1):
+        pass
+
+    @abstractmethod
+    def probability(self, value):
+        pass
+
+
+class BinomialDistribution(Distribution):
+    def __init__(self, n, p):
+        self.n = n
+        self.p = p
+
+    def sample(self, size=1):
+        return binom.rvs(self.n, self.p, size=size)
+
+    def probability(self, value):
+        return binom.pmf(value, self.n, self.p)
+
+
+class PoissonDistribution(Distribution):
+    def __init__(self, mu):
+        self.mu = mu
+
+    def sample(self, size=1):
+        return poisson.rvs(self.mu, size=size)
+
+    def probability(self, value):
+        return poisson.pmf(value, self.mu)
+
+
+class NormalDistribution(Distribution):
+    def __init__(self, mu, sigma):
+        self.mu = mu
+        self.sigma = sigma
+
+    def sample(self, size=1):
+        return norm.rvs(self.mu, self.sigma, size=size)
+
+    def probability(self, value):
+        return norm.pdf(value, self.mu, self.sigma)
+
+
+class ExponentialDistribution(Distribution):
+    def __init__(self, lam):
+        self.lam = lam
+
+    def sample(self, size=1):
+        return expon.rvs(scale=1 / self.lam, size=size)
+
+    def probability(self, value):
+        return expon.pdf(value, scale=1 / self.lam)
+
+
+class GeometricDistribution(Distribution):
+    def __init__(self, p):
+        self.p = p
+
+    def sample(self, size=1):
+        return geom.rvs(self.p, size=size)
+
+    def probability(self, value):
+        return geom.pmf(value, self.p)
+
+
+class UniformDistribution(Distribution):
+    def __init__(self, loc, scale):
+        self.loc = loc
+        self.scale = scale
+
+    def sample(self, size=1):
+        return uniform.rvs(loc=self.loc, scale=self.scale, size=size)
+
+    def probability(self, value):
+        return uniform.pdf(value, loc=self.loc, scale=self.scale)
+
+
+# ============================================================
+# 3. EVENT
+# ============================================================
+class Event:
+    def __init__(self, name, distribution, dependencies=None, dep_type="AND"):
+        self.name = name
+        self.distribution = distribution
+        self.dependencies = dependencies if dependencies else []
+        self.dep_type = dep_type  # AND or OR
+        self.value = None
+        self.probability = None
+
+    def run(self):
+        self.value = self.distribution.sample(size=1)[0]
+        self.probability = self.distribution.probability(self.value)
+        return self.value
+
+
+# ============================================================
+# 4. SIMULATOR (CORRECT LOGIC)
+# ============================================================
+class DependencySimulator:
+    def __init__(self, events):
+        self.events = {e.name: e for e in events}
+        self.graph = nx.DiGraph()
+
+        for e in events:
+            self.graph.add_node(e.name)
+            for d in e.dependencies:
+                self.graph.add_edge(d, e.name)
+
+        if not nx.is_directed_acyclic_graph(self.graph):
+            raise ValueError("Dependency graph must be acyclic")
+
+    def run(self):
+        order = list(nx.topological_sort(self.graph))
+
+        # --- propagate probabilities ---
+        for name in order:
+            event = self.events[name]
+
+            if not event.dependencies:
+                dep_prob = 1.0
+            else:
+                parent_probs = [
+                    self.events[p].probability for p in event.dependencies
+                ]
+
+                if event.dep_type == "AND":
+                    dep_prob = 1.0
+                    for p in parent_probs:
+                        dep_prob *= p
+
+                elif event.dep_type == "OR":
+                    dep_prob = 1.0
+                    for p in parent_probs:
+                        dep_prob *= (1 - p)
+                    dep_prob = 1 - dep_prob
+
+                else:
+                    raise ValueError("Invalid dep_type")
+
+            # sample and condition
+            event.run()
+            event.probability *= dep_prob
+
+        # --- compute SYSTEM probability from terminal nodes ---
+        terminal_events = [
+            e for e in self.events.values()
+            if self.graph.out_degree(e.name) == 0
+        ]
+
+        if not terminal_events:
+            raise ValueError("No terminal events in graph")
+
+        # Default: AND of terminal success
+        system_probability = 1.0
+        for e in terminal_events:
+            system_probability *= e.probability
+
+        return system_probability
+
+
+    def visualize(self):
+        pos = nx.spring_layout(self.graph, seed=42)
+        plt.figure(figsize=(10, 7))
+        nx.draw(
+            self.graph,
+            pos,
+            with_labels=True,
+            node_color="lightblue",
+            node_size=3000,
+            arrows=True,
+            font_size=10,
+        )
+        plt.title("Dependency Graph (AND / OR aware)")
+        plt.show()
+
+
+# ============================================================
+# 5. GUI
+# ============================================================
+class EventWidget(widgets.VBox):
+    def __init__(self, event_names):
+        super().__init__()
+
+        self.name = widgets.Text(description="Name:")
+        self.dist = widgets.Dropdown(
+            options=["Binomial", "Poisson", "Normal", "Exponential", "Geometric", "Uniform"],
+            description="Dist:",
+        )
+        self.dep_type = widgets.Dropdown(
+            options=["AND", "OR"], description="Dep.Type:"
+        )
+        self.p1 = widgets.FloatText(description="P1:")
+        self.p2 = widgets.FloatText(description="P2:")
+        self.dep = widgets.SelectMultiple(options=event_names, description="Depends on:")
+
+        self.dist.observe(self.update_params, names="value")
+        self.update_params(None)
+
+        self.children = [
+            widgets.HBox([self.name, self.dist, self.dep_type]),
+            widgets.HBox([self.p1, self.p2]),
+            self.dep,
+        ]
+
+    def update_params(self, _):
+        d = self.dist.value
+        if d == "Binomial":
+            self.p1.description, self.p2.description = "n", "p"
+            self.p2.disabled = False
+        elif d == "Poisson":
+            self.p1.description, self.p2.description = "μ", ""
+            self.p2.disabled = True
+        elif d == "Normal":
+            self.p1.description, self.p2.description = "μ", "σ"
+            self.p2.disabled = False
+        elif d == "Exponential":
+            self.p1.description, self.p2.description = "λ", ""
+            self.p2.disabled = True
+        elif d == "Geometric":
+            self.p1.description, self.p2.description = "p", ""
+            self.p2.disabled = True
+        elif d == "Uniform":
+            self.p1.description, self.p2.description = "loc", "scale"
+            self.p2.disabled = False
+
+
+# ============================================================
+# 6. APPLICATION
+# ============================================================
+class App:
+    def __init__(self):
+        self.widgets = []
+        self.container = widgets.VBox()
+
+        self.add_btn = widgets.Button(description="Add Event")
+        self.run_btn = widgets.Button(description="Run Simulation")
+
+        self.add_btn.on_click(self.add_event)
+        self.run_btn.on_click(self.run_simulation)
+
+        self.output = widgets.Output()
+
+        display(
+            widgets.HBox([self.add_btn, self.run_btn]),
+            self.container,
+            self.output,
+        )
+
+    def add_event(self, _):
+        names = [w.name.value for w in self.widgets if w.name.value]
+        w = EventWidget(names)
+        self.widgets.append(w)
+        self.container.children = self.widgets
+
+    def run_simulation(self, _):
+        with self.output:
+            clear_output()
+
+            events = []
+            for w in self.widgets:
+                if not w.name.value:
+                    print("Event name missing.")
+                    return
+
+                deps = list(w.dep.value)
+
+                if w.dist.value == "Binomial":
+                    dist = BinomialDistribution(int(w.p1.value), w.p2.value)
+                elif w.dist.value == "Poisson":
+                    dist = PoissonDistribution(w.p1.value)
+                elif w.dist.value == "Normal":
+                    dist = NormalDistribution(w.p1.value, w.p2.value)
+                elif w.dist.value == "Exponential":
+                    dist = ExponentialDistribution(w.p1.value)
+                elif w.dist.value == "Geometric":
+                    dist = GeometricDistribution(w.p1.value)
+                else:
+                    dist = UniformDistribution(w.p1.value, w.p2.value)
+
+                events.append(
+                    Event(
+                        name=w.name.value,
+                        distribution=dist,
+                        dependencies=deps,
+                        dep_type=w.dep_type.value,
+                    )
+                )
+
+            sim = DependencySimulator(events)
+            total = sim.run()
+
+            print("=== EVENT RESULTS ===")
+            for e in events:
+                print(
+                    f"{e.name}: value={e.value}, P={e.probability:.6e}, dep={e.dep_type}"
+                )
+
+            print(f"\nTOTAL SYSTEM PROBABILITY = {total:.6e}")
+            sim.visualize()
+
+
+# ============================================================
+# 7. RUN
+# ============================================================
+if __name__ == "__main__":
+    App()
